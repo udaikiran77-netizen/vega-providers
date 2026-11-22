@@ -1,6 +1,7 @@
 import { ProviderContext, Stream, TextTracks } from "../types";
 
 const CINEJOY_ORIGIN = "https://cinejoy.pk";
+const WING_API = "https://api2.wing.st";
 const FALLBACK_SERVERS: Array<{ name: string; status?: string; "4k"?: boolean }> = [
   { name: "Light", "4k": true },
   { name: "Nebula" },
@@ -8,51 +9,15 @@ const FALLBACK_SERVERS: Array<{ name: string; status?: string; "4k"?: boolean }>
   { name: "Polaris" },
 ];
 
-let cachedCode: string | null = null;
 let cachedServers: Array<{ name: string; status?: string; "4k"?: boolean }> = [
   ...FALLBACK_SERVERS,
 ];
 let lastServerFetchTime = 0;
+let cachedWasmBytes: Uint8Array | null = null;
 
-function safeBtoa(str: string): string {
-  if (typeof btoa !== "undefined") return btoa(str);
-  const chars =
-    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=";
-  let output = "";
-  for (
-    let block = 0, charCode, i = 0, map = chars;
-    str.charAt(i | 0) || ((map = "="), i % 1);
-    output += map.charAt(63 & (block >> (8 - (i % 1) * 8)))
-  ) {
-    charCode = str.charCodeAt((i += 3 / 4));
-    if (charCode > 0xff) {
-      throw new Error("Invalid character in btoa");
-    }
-    block = (block << 8) | charCode;
-  }
-  return output;
-}
-
-function safeAtob(input: string): string {
-  if (typeof atob !== "undefined") return atob(input);
-  const chars =
-    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=";
-  const str = String(input).replace(/=+$/, "");
-  let output = "";
-  if (str.length % 4 === 1) {
-    throw new Error("Invalid atob length");
-  }
-  for (
-    let bc = 0, bs = 0, buffer: any, i = 0;
-    (buffer = str.charAt(i++));
-    ~buffer && ((bs = bc % 4 ? bs * 64 + buffer : buffer), bc++ % 4)
-      ? (output += String.fromCharCode(255 & (bs >> ((-2 * bc) & 6))))
-      : 0
-  ) {
-    buffer = chars.indexOf(buffer);
-  }
-  return output;
-}
+// ---------------------------------------------------------------------------
+// Byte helpers
+// ---------------------------------------------------------------------------
 
 function toUint8Array(rawData: any): Uint8Array {
   if (!rawData) return new Uint8Array(0);
@@ -61,18 +26,41 @@ function toUint8Array(rawData: any): Uint8Array {
   if (ArrayBuffer.isView(rawData)) {
     return new Uint8Array(rawData.buffer, rawData.byteOffset, rawData.byteLength);
   }
-  if (typeof rawData === "string") {
-    if (typeof TextEncoder !== "undefined") {
-      return new TextEncoder().encode(rawData);
-    }
-    const out = new Uint8Array(rawData.length);
-    for (let i = 0; i < rawData.length; i++) out[i] = rawData.charCodeAt(i) & 0xff;
-    return out;
-  }
+  if (typeof rawData === "string") return utf8Encode(rawData);
+  if (Array.isArray(rawData)) return new Uint8Array(rawData);
+  // Node-style Buffer JSON ({type:"Buffer",data:[...]}) from some transports
+  if (rawData && Array.isArray(rawData.data)) return new Uint8Array(rawData.data);
   return new Uint8Array(0);
 }
 
-function decodeUtf8(uint8: Uint8Array): string {
+function utf8Encode(str: string): Uint8Array {
+  if (typeof TextEncoder !== "undefined") {
+    return new TextEncoder().encode(str);
+  }
+  const out: number[] = [];
+  for (let i = 0; i < str.length; i++) {
+    let code = str.charCodeAt(i);
+    if (code < 0x80) {
+      out.push(code);
+    } else if (code < 0x800) {
+      out.push(0xc0 | (code >> 6), 0x80 | (code & 0x3f));
+    } else if (code >= 0xd800 && code <= 0xdbff && i + 1 < str.length) {
+      const lo = str.charCodeAt(++i);
+      const cp = 0x10000 + ((code - 0xd800) << 10) + (lo - 0xdc00);
+      out.push(
+        0xf0 | (cp >> 18),
+        0x80 | ((cp >> 12) & 0x3f),
+        0x80 | ((cp >> 6) & 0x3f),
+        0x80 | (cp & 0x3f)
+      );
+    } else {
+      out.push(0xe0 | (code >> 12), 0x80 | ((code >> 6) & 0x3f), 0x80 | (code & 0x3f));
+    }
+  }
+  return new Uint8Array(out);
+}
+
+function utf8Decode(uint8: Uint8Array): string {
   if (typeof TextDecoder !== "undefined") {
     try {
       return new TextDecoder("utf-8").decode(uint8);
@@ -85,341 +73,302 @@ function decodeUtf8(uint8: Uint8Array): string {
   return out;
 }
 
-function parseExportMap(code: string): Record<string, string> {
-  const match = code.match(/export\s*\{([^}]+)\}\s*;?\s*$/);
-  if (!match) return {};
-  const map: Record<string, string> = {};
-  for (const part of match[1].split(",")) {
-    const trimmed = part.trim();
-    if (!trimmed) continue;
-    const asMatch = trimmed.match(/^([A-Za-z_$][A-Za-z0-9_$]*)\s+as\s+([A-Za-z_$][A-Za-z0-9_$]*)$/);
-    if (asMatch) {
-      map[asMatch[2]] = asMatch[1];
-    } else if (/^[A-Za-z_$][A-Za-z0-9_$]*$/.test(trimmed)) {
-      map[trimmed] = trimmed;
-    }
+function randomBytes(n: number): Uint8Array {
+  const out = new Uint8Array(n);
+  const c: any = typeof crypto !== "undefined" ? crypto : undefined;
+  if (c && typeof c.getRandomValues === "function") {
+    c.getRandomValues(out);
+    return out;
   }
-  return map;
+  for (let i = 0; i < n; i++) out[i] = Math.floor(Math.random() * 256);
+  return out;
 }
 
-function extractImportedLocals(code: string): string[] {
-  const locals = new Set<string>();
-  const importRegex = /^\s*import\s*([\s\S]*?)\s*from\s*["'][^"']+["']\s*;/gm;
-  let m: RegExpExecArray | null;
-  while ((m = importRegex.exec(code)) !== null) {
-    const clause = m[1].trim();
-    const braceMatch = clause.match(/\{([^}]+)\}/);
-    if (braceMatch) {
-      for (const part of braceMatch[1].split(",")) {
-        const trimmed = part.trim();
-        if (!trimmed) continue;
-        const asMatch = trimmed.match(/as\s+([A-Za-z_$][A-Za-z0-9_$]*)$/);
-        const name = asMatch ? asMatch[1] : trimmed;
-        if (/^[A-Za-z_$][A-Za-z0-9_$]*$/.test(name)) locals.add(name);
+// ---------------------------------------------------------------------------
+// Pure-JS AES-256-GCM decryption (the wing.st gateway encrypts its response
+// with AES-256-GCM; WebCrypto subtle is not available in every sandbox, so
+// the decryption is done here directly).
+// ---------------------------------------------------------------------------
+
+const AES_SBOX: Uint8Array = (() => {
+  function mul(a: number, b: number): number {
+    let r = 0;
+    while (b) {
+      if (b & 1) r ^= a;
+      a = ((a << 1) ^ (a & 0x80 ? 0x1b : 0)) & 0xff;
+      b >>= 1;
+    }
+    return r;
+  }
+  function inv(a: number): number {
+    if (a === 0) return 0;
+    for (let i = 1; i < 256; i++) if (mul(a, i) === 1) return i;
+    return 0;
+  }
+  const s = new Uint8Array(256);
+  for (let i = 0; i < 256; i++) {
+    const v = inv(i);
+    s[i] =
+      (v ^
+        ((v << 1) | (v >> 7)) ^
+        ((v << 2) | (v >> 6)) ^
+        ((v << 3) | (v >> 5)) ^
+        ((v << 4) | (v >> 4)) ^
+        0x63) &
+      0xff;
+  }
+  return s;
+})();
+const AES_RCON = [0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80, 0x1b, 0x36, 0x6c, 0xd8, 0xab, 0x4d];
+
+function aes256ExpandKey(key: Uint8Array): Uint8Array {
+  const Nk = 8;
+  const Nr = 14;
+  const w = new Uint8Array(16 * (Nr + 1));
+  w.set(key);
+  for (let i = Nk; i < 4 * (Nr + 1); i++) {
+    let t = [w[4 * (i - 1)], w[4 * (i - 1) + 1], w[4 * (i - 1) + 2], w[4 * (i - 1) + 3]];
+    if (i % Nk === 0) {
+      t = [AES_SBOX[t[1]] ^ AES_RCON[i / Nk - 1], AES_SBOX[t[2]], AES_SBOX[t[3]], AES_SBOX[t[0]]];
+    } else if (i % Nk === 4) {
+      t = [AES_SBOX[t[0]], AES_SBOX[t[1]], AES_SBOX[t[2]], AES_SBOX[t[3]]];
+    }
+    for (let j = 0; j < 4; j++) w[4 * i + j] = w[4 * (i - Nk) + j] ^ t[j];
+  }
+  return w;
+}
+
+function aesEncryptBlock(w: Uint8Array, input: Uint8Array): Uint8Array {
+  const Nr = 14;
+  const s = new Uint8Array(16);
+  for (let i = 0; i < 16; i++) s[i] = input[i] ^ w[i];
+  const mul2 = (a: number) => ((a << 1) ^ (a & 0x80 ? 0x1b : 0)) & 0xff;
+  function subBytes() {
+    for (let i = 0; i < 16; i++) s[i] = AES_SBOX[s[i]];
+  }
+  function shiftRows() {
+    const t = new Uint8Array(16);
+    for (let r = 0; r < 4; r++)
+      for (let c = 0; c < 4; c++) t[r + 4 * c] = s[r + 4 * ((c + r) % 4)];
+    s.set(t);
+  }
+  function mixColumns() {
+    for (let c = 0; c < 4; c++) {
+      const a0 = s[4 * c], a1 = s[4 * c + 1], a2 = s[4 * c + 2], a3 = s[4 * c + 3];
+      const x0 = mul2(a0), x1 = mul2(a1), x2 = mul2(a2), x3 = mul2(a3);
+      s[4 * c] = x0 ^ (x1 ^ a1) ^ a2 ^ a3;
+      s[4 * c + 1] = a0 ^ x1 ^ (x2 ^ a2) ^ a3;
+      s[4 * c + 2] = a0 ^ a1 ^ x2 ^ (x3 ^ a3);
+      s[4 * c + 3] = (x0 ^ a0) ^ a1 ^ a2 ^ x3;
+    }
+  }
+  function addRound(r: number) {
+    for (let i = 0; i < 16; i++) s[i] ^= w[16 * r + i];
+  }
+  for (let round = 1; round < Nr; round++) {
+    subBytes();
+    shiftRows();
+    mixColumns();
+    addRound(round);
+  }
+  subBytes();
+  shiftRows();
+  addRound(Nr);
+  return s;
+}
+
+function ghash(H: Uint8Array, data: Uint8Array): Uint8Array {
+  const x = new Uint8Array(16);
+  for (let off = 0; off < data.length; off += 16) {
+    for (let j = 0; j < 16; j++) x[j] ^= data[off + j];
+    const z = new Uint8Array(16);
+    const v = new Uint8Array(x);
+    for (let i = 0; i < 128; i++) {
+      if ((H[i >> 3] >> (7 - (i & 7))) & 1) {
+        for (let j = 0; j < 16; j++) z[j] ^= v[j];
       }
+      const lsb = v[15] & 1;
+      for (let j = 15; j > 0; j--) v[j] = ((v[j] >> 1) | ((v[j - 1] & 1) << 7)) & 0xff;
+      v[0] >>= 1;
+      if (lsb) v[0] ^= 0xe1;
     }
-    const starMatch = clause.match(/\*\s+as\s+([A-Za-z_$][A-Za-z0-9_$]*)/);
-    if (starMatch) locals.add(starMatch[1]);
-    const defMatch = clause.match(/^([A-Za-z_$][A-Za-z0-9_$]*)/);
-    if (defMatch) locals.add(defMatch[1]);
+    x.set(z);
   }
-  return Array.from(locals);
+  return x;
 }
 
-function stripModuleSyntax(code: string): string {
-  return code
-    .replace(/^\s*import\s*(?:[\s\S]*?from\s*)?["'][^"']+["']\s*;?/gm, "")
-    .replace(/export\s*\{[^}]+\}\s*;?\s*$/, "");
+function pad16(b: Uint8Array): Uint8Array {
+  if (b.length % 16 === 0) return b;
+  const out = new Uint8Array(b.length + (16 - (b.length % 16)));
+  out.set(b);
+  return out;
 }
 
-function buildSandbox(
+function aesGcmDecrypt(
+  key: Uint8Array,
+  iv: Uint8Array,
+  ciphertextWithTag: Uint8Array,
+  aad: Uint8Array
+): Uint8Array {
+  if (ciphertextWithTag.length < 16) throw new Error("ciphertext too short");
+  const w = aes256ExpandKey(key);
+  const H = aesEncryptBlock(w, new Uint8Array(16));
+  const J0 = new Uint8Array(16);
+  J0.set(iv.subarray(0, 12));
+  J0[15] = 1;
+  const ct = ciphertextWithTag.subarray(0, ciphertextWithTag.length - 16);
+  const tagGiven = ciphertextWithTag.subarray(ciphertextWithTag.length - 16);
+  const aadP = pad16(aad);
+  const ctP = pad16(new Uint8Array(ct));
+  const ghData = new Uint8Array(aadP.length + ctP.length + 16);
+  ghData.set(aadP, 0);
+  ghData.set(ctP, aadP.length);
+  const dv = new DataView(ghData.buffer);
+  dv.setUint32(ghData.length - 16, 0);
+  dv.setUint32(ghData.length - 12, aad.length * 8);
+  dv.setUint32(ghData.length - 8, 0);
+  dv.setUint32(ghData.length - 4, ct.length * 8);
+  const S = ghash(H, ghData);
+  const EJ0 = aesEncryptBlock(w, J0);
+  for (let i = 0; i < 16; i++) {
+    if ((S[i] ^ EJ0[i]) !== tagGiven[i]) throw new Error("GCM tag mismatch");
+  }
+  const out = new Uint8Array(ct.length);
+  const counter = new Uint8Array(J0);
+  for (let off = 0; off < ct.length; off += 16) {
+    let c =
+      ((counter[12] << 24) | (counter[13] << 16) | (counter[14] << 8) | counter[15]) >>> 0;
+    c = (c + 1) >>> 0;
+    counter[12] = (c >> 24) & 0xff;
+    counter[13] = (c >> 16) & 0xff;
+    counter[14] = (c >> 8) & 0xff;
+    counter[15] = c & 0xff;
+    const ks = aesEncryptBlock(w, counter);
+    const n = Math.min(16, ct.length - off);
+    for (let j = 0; j < n; j++) out[off + j] = ct[off + j] ^ ks[j];
+  }
+  return out;
+}
+
+// ---------------------------------------------------------------------------
+// wing.st gateway protocol (the same one the Cinejoy web player uses):
+//   1. GET  /servers            -> server list
+//   2. GET  /crush.wasm          -> request sealer (exports alloc/dealloc/seal_request)
+//   3. seal_request(in, rand44) -> [0..32) response AES key, [98..) request body
+//   4. POST /g  (text/plain)     -> iv(12) || AES-256-GCM ciphertext+tag
+//   5. decrypt with AAD = "lumen-gate-v2" || 0x00 || body[0..67)
+// ---------------------------------------------------------------------------
+
+async function getWasmInstance(
   axios: any,
   headers: Record<string, string>,
-  watchPath: string,
-  importedLocals: string[],
   signal?: AbortSignal
-): Record<string, any> {
-  const safeCrypto =
-    typeof crypto !== "undefined" && crypto
-      ? typeof crypto.getRandomValues === "function"
-        ? crypto
-        : {
-            ...crypto,
-            getRandomValues: (arr: Uint8Array) => {
-              for (let i = 0; i < arr.length; i++) {
-                arr[i] = Math.floor(Math.random() * 256);
-              }
-              return arr;
-            },
-          }
-      : {
-          getRandomValues: (arr: Uint8Array) => {
-            for (let i = 0; i < arr.length; i++) {
-              arr[i] = Math.floor(Math.random() * 256);
-            }
-            return arr;
-          },
-        };
-
-  const locationObj = {
-    origin: CINEJOY_ORIGIN,
-    href: `${CINEJOY_ORIGIN}${watchPath}`,
-    pathname: watchPath,
-    host: "cinejoy.pk",
-    hostname: "cinejoy.pk",
-  };
-
-  const sandbox: Record<string, any> = {
-    console: { log: () => {}, warn: () => {}, error: () => {} },
-    Map,
-    Set,
-    Promise,
-    TextEncoder: typeof TextEncoder !== "undefined" ? TextEncoder : undefined,
-    TextDecoder: typeof TextDecoder !== "undefined" ? TextDecoder : undefined,
-    URL: typeof URL !== "undefined" ? URL : undefined,
-    URLSearchParams:
-      typeof URLSearchParams !== "undefined" ? URLSearchParams : undefined,
-    setTimeout: typeof setTimeout !== "undefined" ? setTimeout : undefined,
-    clearTimeout: typeof clearTimeout !== "undefined" ? clearTimeout : undefined,
-    setInterval: typeof setInterval !== "undefined" ? setInterval : undefined,
-    clearInterval:
-      typeof clearInterval !== "undefined" ? clearInterval : undefined,
-    AbortController:
-      typeof AbortController !== "undefined" ? AbortController : undefined,
-    btoa: safeBtoa,
-    atob: safeAtob,
-    crypto: safeCrypto,
-    WebAssembly: typeof WebAssembly !== "undefined" ? WebAssembly : undefined,
-    caches: {
-      open: async () => ({
-        match: async () => null,
-        put: async () => {},
-      }),
-    },
-    location: locationObj,
-    window: {
-      location: locationObj,
-      localStorage: { getItem: () => null, setItem: () => {} },
-    },
-    document: {
-      referrer: `${CINEJOY_ORIGIN}/`,
-      title: "Cinejoy",
-      createElement: () => ({}),
-      head: { appendChild: () => {} },
-      body: { appendChild: () => {} },
-    },
-    navigator: {
-      onLine: true,
-      userAgent: headers["User-Agent"],
-    },
-    fetch: async (u: any, opts?: any) => {
-      const url = typeof u === "string" ? u : String(u);
-      let bodyData = opts?.body;
-      if (bodyData instanceof ArrayBuffer) {
-        bodyData = new Uint8Array(bodyData);
-      }
-      try {
-        const fetchRes = await axios({
-          url,
-          method: opts?.method || "GET",
-          headers: {
-            ...headers,
-            ...(opts?.headers || {}),
-          },
-          data: bodyData,
-          responseType: "arraybuffer",
-          timeout: 12000,
-          signal,
-        });
-        const uint8 = toUint8Array(fetchRes.data);
-        return {
-          ok: fetchRes.status >= 200 && fetchRes.status < 300,
-          status: fetchRes.status,
-          text: async () => decodeUtf8(uint8),
-          json: async () => JSON.parse(decodeUtf8(uint8)),
-          arrayBuffer: async () =>
-            uint8.buffer.slice(
-              uint8.byteOffset,
-              uint8.byteOffset + uint8.byteLength
-            ),
-          headers: new Map(Object.entries(fetchRes.headers || {})),
-        };
-      } catch (e: any) {
-        const uint8 = e?.response?.data
-          ? toUint8Array(e.response.data)
-          : new Uint8Array(0);
-        return {
-          ok: false,
-          status: e?.response?.status || 500,
-          text: async () => decodeUtf8(uint8),
-          json: async () => (uint8.length ? JSON.parse(decodeUtf8(uint8)) : {}),
-          arrayBuffer: async () =>
-            uint8.buffer.slice(
-              uint8.byteOffset,
-              uint8.byteOffset + uint8.byteLength
-            ),
-          headers: new Map(Object.entries(e?.response?.headers || {})),
-        };
-      }
-    },
-  };
-
-  for (const local of importedLocals) {
-    if (!(local in sandbox)) {
-      sandbox[local] = {};
-    }
+): Promise<any> {
+  if (typeof WebAssembly === "undefined") {
+    throw new Error("WebAssembly unavailable");
   }
-  sandbox.globalThis = sandbox;
-  sandbox.self = sandbox;
-  return sandbox;
+  if (!cachedWasmBytes) {
+    const res = await axios.get(`${WING_API}/crush.wasm`, {
+      headers,
+      responseType: "arraybuffer",
+      timeout: 15000,
+      signal,
+    });
+    cachedWasmBytes = toUint8Array(res.data);
+    if (!cachedWasmBytes.length) throw new Error("empty crush.wasm");
+  }
+  const bytes = cachedWasmBytes;
+  if (typeof WebAssembly.instantiate === "function") {
+    const out: any = await WebAssembly.instantiate(bytes, {});
+    return out.instance || out;
+  }
+  const mod = await (WebAssembly as any).compile(bytes);
+  return new (WebAssembly as any).Instance(mod, {});
 }
 
-function evaluateCinejoyChunk(
-  code: string,
-  sandbox: Record<string, any>
-): Record<string, any> {
-  const exportMap = parseExportMap(code);
-  const strippedCode = stripModuleSyntax(code);
-  const returnEntries = Object.entries(exportMap).map(
-    ([exported, local]) =>
-      `${JSON.stringify(exported)}: (typeof ${local} !== "undefined" ? ${local} : undefined)`
-  );
-  const returnExpr = `{ ${returnEntries.join(", ")} }`;
-
+function sealGatewayRequest(
+  instance: any,
+  plaintext: Uint8Array
+): { respKey: Uint8Array; body: Uint8Array } {
+  const { alloc, dealloc, seal_request, memory } = instance.exports;
+  const rand = randomBytes(44);
+  const inPtr = alloc(plaintext.length);
+  const midPtr = alloc(44);
+  const outCap = plaintext.length + 1024;
+  const outPtr = alloc(outCap);
   try {
-    const runner = new Function(
-      "sandbox",
-      `with(sandbox){\n${strippedCode}\n;return ${returnExpr};\n}`
-    );
-    return runner(sandbox) || {};
-  } catch {
-    const keys = Object.keys(sandbox).filter((k) =>
-      /^[A-Za-z_$][A-Za-z0-9_$]*$/.test(k)
-    );
-    const values = keys.map((k) => sandbox[k]);
-    const runner = new Function(
-      ...keys,
-      `${strippedCode}\n;return ${returnExpr};\n`
-    );
-    return runner(...values) || {};
-  }
-}
-
-function selectResolver(
-  exportsObj: Record<string, any>
-): ((...args: any[]) => Promise<any>) | null {
-  if (typeof exportsObj.s === "function") {
-    return exportsObj.s;
-  }
-  for (const val of Object.values(exportsObj)) {
-    if (typeof val === "function" && val.length === 4) {
-      const src = String(val);
-      if (
-        src.includes("result") &&
-        src.includes("providers") &&
-        src.includes("failure")
-      ) {
-        return val as (...args: any[]) => Promise<any>;
-      }
+    let mem = new Uint8Array(memory.buffer);
+    mem.set(plaintext, inPtr);
+    mem.set(rand, midPtr);
+    const outLen = seal_request(inPtr, plaintext.length, midPtr, 44, outPtr, outCap);
+    if (!outLen || outLen <= 98 + 67) {
+      throw new Error(`seal_request failed (${outLen})`);
     }
-  }
-  return null;
-}
-
-async function discoverCinejoyChunk(
-  axios: any,
-  headers: Record<string, string>,
-  isMovie: boolean,
-  signal?: AbortSignal
-): Promise<string | null> {
-  if (cachedCode) return cachedCode;
-
-  const homeRes = await axios.get(`${CINEJOY_ORIGIN}/`, {
-    headers,
-    timeout: 6000,
-    signal,
-  });
-  const html = typeof homeRes.data === "string" ? homeRes.data : "";
-  const appMatch = html.match(
-    /_app\/immutable\/entry\/app\.[A-Za-z0-9_-]+\.js/
-  );
-  if (!appMatch) return null;
-
-  const appRes = await axios.get(`${CINEJOY_ORIGIN}/${appMatch[0]}`, {
-    headers,
-    timeout: 6000,
-    signal,
-  });
-  const appText = typeof appRes.data === "string" ? appRes.data : "";
-
-  const movieNodeId = appText.match(
-    /"\/watch\/movie\/\[id\]"\s*:\s*\[(\d+)/
-  )?.[1];
-  const tvNodeId = appText.match(
-    /"\/watch\/tv\/\[id\][^"]*"\s*:\s*\[(\d+)/
-  )?.[1];
-  const targetNodeId = isMovie
-    ? movieNodeId || tvNodeId
-    : tvNodeId || movieNodeId;
-  if (!targetNodeId) return null;
-
-  const nodeMatches = [...appText.matchAll(/nodes\/(\d+)\.[A-Za-z0-9_-]+\.js/g)];
-  const nodeMatch =
-    nodeMatches.find((m) => m[1] === targetNodeId) ||
-    (movieNodeId ? nodeMatches.find((m) => m[1] === movieNodeId) : undefined);
-  if (!nodeMatch) return null;
-
-  const nodeRes = await axios.get(
-    `${CINEJOY_ORIGIN}/_app/immutable/${nodeMatch[0]}`,
-    { headers, timeout: 6000, signal }
-  );
-  const nodeText = typeof nodeRes.data === "string" ? nodeRes.data : "";
-
-  const chunkNames = Array.from(
-    new Set(
-      [...nodeText.matchAll(/chunks\/([A-Za-z0-9_-]+\.js)/g)].map((m) => m[1])
-    )
-  );
-
-  for (const ch of chunkNames) {
+    mem = new Uint8Array(memory.buffer);
+    const out = mem.slice(outPtr, outPtr + outLen);
+    const body = out.slice(98);
+    if (body[0] !== 0x02 || body[1] !== 0x02 || body[2] !== 0x04) {
+      throw new Error("unexpected sealed body");
+    }
+    return { respKey: out.slice(0, 32), body };
+  } finally {
     try {
-      const chRes = await axios.get(
-        `${CINEJOY_ORIGIN}/_app/immutable/chunks/${ch}`,
-        { headers, timeout: 6000, signal }
-      );
-      const chText = typeof chRes.data === "string" ? chRes.data : "";
-      if (!chText.includes("WebAssembly")) continue;
-      if (!/export\s*\{[^}]+\}\s*;?\s*$/.test(chText)) continue;
-
-      const probeSandbox = buildSandbox(
-        axios,
-        headers,
-        "/",
-        extractImportedLocals(chText),
-        signal
-      );
-      const probeExports = evaluateCinejoyChunk(chText, probeSandbox);
-      const hasFourArgFn = Object.values(probeExports).some(
-        (v) => typeof v === "function" && v.length === 4
-      );
-      if (hasFourArgFn) {
-        cachedCode = chText;
-        return chText;
-      }
-    } catch {
-      // Try next chunk
-    }
+      dealloc(inPtr, plaintext.length);
+      dealloc(midPtr, 44);
+      dealloc(outPtr, outCap);
+    } catch {}
   }
-
-  return null;
 }
+
+async function resolveViaGateway({
+  axios,
+  headers,
+  serverName,
+  mediaKind,
+  payload,
+  signal,
+}: {
+  axios: any;
+  headers: Record<string, string>;
+  serverName: string;
+  mediaKind: "movie" | "series";
+  payload: Record<string, string>;
+  signal?: AbortSignal;
+}): Promise<any> {
+  const instance = await getWasmInstance(axios, headers, signal);
+  const plaintext = utf8Encode(
+    JSON.stringify({ path: `/${serverName}/${mediaKind}`, payload })
+  );
+  const { respKey, body } = sealGatewayRequest(instance, plaintext);
+  const res = await axios({
+    url: `${WING_API}/g`,
+    method: "POST",
+    headers: { ...headers, "Content-Type": "text/plain;charset=UTF-8" },
+    data: body,
+    responseType: "arraybuffer",
+    timeout: 15000,
+    signal,
+  });
+  const resBytes = toUint8Array(res.data);
+  if (resBytes.length <= 12 + 16) throw new Error("short gateway response");
+  const iv = resBytes.slice(0, 12);
+  const ctTag = resBytes.slice(12);
+  const aad = new Uint8Array(14 + 67);
+  aad.set(utf8Encode("lumen-gate-v2"), 0);
+  aad[13] = 0;
+  aad.set(body.subarray(0, 67), 14);
+  const plain = aesGcmDecrypt(respKey, iv, ctTag, aad);
+  return JSON.parse(utf8Decode(plain));
+}
+
+// ---------------------------------------------------------------------------
 
 function mapCaption(c: any): TextTracks[number] | null {
   const uri = c?.url || c?.file;
   if (!uri) return null;
-  const langRaw = c.language || c.lang || "en";
+  const langRaw = c.language || c.lang || c.id || "en";
   return {
-    title: c.display || c.label || c.language || "Subtitle",
+    title: c.display || c.label || c.language || c.lang || c.id || "Subtitle",
     language: String(langRaw).slice(0, 2).toLowerCase(),
     type:
       c.type === "vtt" || String(uri).endsWith(".vtt")
@@ -496,11 +445,11 @@ export async function extractCinejoyStreams({
 }): Promise<Stream[]> {
   const { axios, commonHeaders } = providerContext;
   const isMovie = type === "movie";
-  const mediaType = isMovie ? "movie" : "tv";
+  const mediaKind: "movie" | "series" = isMovie ? "movie" : "series";
 
   if (!tmdbId) return [];
 
-  const watchPath = `/watch/${mediaType}/${tmdbId}${
+  const watchPath = `/watch/${isMovie ? "movie" : "tv"}/${tmdbId}${
     isMovie ? "" : `/${season || 1}/${episode || 1}`
   }`;
 
@@ -513,18 +462,18 @@ export async function extractCinejoyStreams({
   };
 
   try {
-    const chunkCode = await discoverCinejoyChunk(axios, headers, isMovie, signal);
-    if (!chunkCode) return [];
-
     if (Date.now() - lastServerFetchTime > 300000) {
       try {
-        const sRes = await axios.get("https://api2.wing.st/servers", {
+        const sRes = await axios.get(`${WING_API}/servers`, {
           headers,
-          timeout: 5000,
+          timeout: 8000,
           signal,
         });
-        if (Array.isArray(sRes.data?.servers) && sRes.data.servers.length) {
-          const available = sRes.data.servers.filter(
+        const list = Array.isArray(sRes.data)
+          ? sRes.data
+          : sRes.data?.servers;
+        if (Array.isArray(list) && list.length) {
+          const available = list.filter(
             (s: any) => s && s.name && s.status !== "offline"
           );
           if (available.length) {
@@ -540,7 +489,7 @@ export async function extractCinejoyStreams({
         const subUrl = `https://subs.wing.st/subtitles?tmdb=${tmdbId}${
           isMovie ? "" : `&season=${season || 1}&episode=${episode || 1}`
         }`;
-        const subRes = await axios.get(subUrl, { headers, timeout: 5000, signal });
+        const subRes = await axios.get(subUrl, { headers, timeout: 8000, signal });
         const rawList = Array.isArray(subRes.data)
           ? subRes.data
           : Array.isArray(subRes.data?.subtitles)
@@ -556,17 +505,6 @@ export async function extractCinejoyStreams({
       }
     })();
 
-    const sandbox = buildSandbox(
-      axios,
-      headers,
-      watchPath,
-      extractImportedLocals(chunkCode),
-      signal
-    );
-    const exportsObj = evaluateCinejoyChunk(chunkCode, sandbox);
-    const resolver = selectResolver(exportsObj);
-    if (!resolver) return [];
-
     const activeServers = (cachedServers || []).filter(
       (s) => s && s.name && s.status !== "offline"
     );
@@ -578,86 +516,97 @@ export async function extractCinejoyStreams({
       "User-Agent": headers["User-Agent"],
     };
 
-    const resolverParams: Record<string, any> = {
-      tmdbId: String(tmdbId),
-      ...(imdbId ? { imdbId } : {}),
-      ...(year ? { year } : {}),
-      ...(title ? { title } : {}),
-      ...(!isMovie
-        ? { season: Number(season || 1), episode: Number(episode || 1) }
-        : {}),
-    };
+    // Payload shape used by the Cinejoy web player, keys in the same order.
+    const payload: Record<string, string> = { tmdb: String(tmdbId) };
+    if (!isMovie) {
+      payload.season = String(season || 1);
+      payload.episode = String(episode || 1);
+    }
+    if (imdbId) payload.imdb = String(imdbId);
+    if (year) payload.year = String(year);
+    if (title) payload.title = String(title);
 
     const streams: Stream[] = [];
     const seenLinks = new Set<string>();
 
     const tasks = activeServers.map(async (srv) => {
       try {
-        const res = await raceWithTimeout(
-          resolver(mediaType, resolverParams, () => {}, srv.name),
-          12000,
+        const json = await raceWithTimeout(
+          resolveViaGateway({
+            axios,
+            headers,
+            serverName: srv.name,
+            mediaKind,
+            payload,
+            signal,
+          }),
+          40000,
           signal
         );
-        const result = res?.result;
-        if (!result || !result.url) return;
+        const entries = Array.isArray(json?.data?.stream) ? json.data.stream : [];
+        for (const entry of entries) {
+          const playlist = entry?.playlist || entry?.url;
+          if (!playlist) continue;
+          const streamUrl = String(playlist);
+          if (seenLinks.has(streamUrl)) continue;
 
-        const streamUrl = String(result.url);
-        if (seenLinks.has(streamUrl)) return;
+          const streamType =
+            entry.type === "hls" || streamUrl.includes(".m3u8")
+              ? "m3u8"
+              : entry.type || "mp4";
 
-        const streamType =
-          result.sourceType === "hls"
-            ? "m3u8"
-            : result.sourceType || "mp4";
-
-        if (streamType === "m3u8") {
-          try {
-            const playlist = await axios.get(streamUrl, {
-              headers: streamHeaders,
-              timeout: 4000,
-              signal,
-            });
-            if (
-              typeof playlist.data !== "string" ||
-              !playlist.data.trimStart().startsWith("#EXTM3U")
-            ) {
-              return;
+          if (streamType === "m3u8") {
+            try {
+              const playlistRes = await axios.get(streamUrl, {
+                headers: streamHeaders,
+                timeout: 8000,
+                signal,
+              });
+              const text =
+                typeof playlistRes.data === "string"
+                  ? playlistRes.data
+                  : utf8Decode(toUint8Array(playlistRes.data));
+              if (!text.trimStart().startsWith("#EXTM3U")) {
+                continue;
+              }
+            } catch {
+              // Inconclusive check (network) - keep the stream, the
+              // gateway already validated the server for this title.
             }
-          } catch {
-            return;
           }
-        }
 
-        if (seenLinks.has(streamUrl)) return;
-        seenLinks.add(streamUrl);
+          if (seenLinks.has(streamUrl)) continue;
+          seenLinks.add(streamUrl);
 
-        const rawSubs = [
-          ...(Array.isArray(result.captions)
-            ? result.captions
-                .map(mapCaption)
-                .filter(
-                  (s: TextTracks[number] | null): s is TextTracks[number] =>
-                    Boolean(s)
-                )
-            : []),
-          ...externalSubtitles,
-        ];
-        const seenSubs = new Set<string>();
-        const subtitles: TextTracks = [];
-        for (const s of rawSubs) {
-          if (s.uri && !seenSubs.has(s.uri)) {
-            seenSubs.add(s.uri);
-            subtitles.push(s);
+          const rawSubs = [
+            ...(Array.isArray(entry.captions)
+              ? entry.captions
+                  .map(mapCaption)
+                  .filter(
+                    (s: TextTracks[number] | null): s is TextTracks[number] =>
+                      Boolean(s)
+                  )
+              : []),
+            ...externalSubtitles,
+          ];
+          const seenSubs = new Set<string>();
+          const subtitles: TextTracks = [];
+          for (const s of rawSubs) {
+            if (s.uri && !seenSubs.has(s.uri)) {
+              seenSubs.add(s.uri);
+              subtitles.push(s);
+            }
           }
-        }
 
-        streams.push({
-          server: `Cinejoy - ${srv.name}${srv["4k"] ? " (4K)" : ""}`,
-          link: streamUrl,
-          type: streamType,
-          quality: srv["4k"] ? "2160" : "1080",
-          subtitles: subtitles.length ? subtitles : undefined,
-          headers: streamHeaders,
-        });
+          streams.push({
+            server: `Cinejoy - ${srv.name}${srv["4k"] ? " (4K)" : ""}`,
+            link: streamUrl,
+            type: streamType,
+            quality: srv["4k"] ? "2160" : "1080",
+            subtitles: subtitles.length ? subtitles : undefined,
+            headers: streamHeaders,
+          });
+        }
       } catch {
         // Skip server if unavailable or timed out
       }
