@@ -13,9 +13,9 @@ const UA =
 
 function siteHeaders(providerContext: ProviderContext) {
   return {
+    ...(providerContext.commonHeaders || {}),
     "User-Agent": UA,
     Referer: `${SITE_ORIGIN}/`,
-    ...(providerContext.commonHeaders || {}),
   };
 }
 

@@ -22,10 +22,12 @@ const UA =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
 
 function apiHeaders(providerContext: ProviderContext) {
+  // commonHeaders go FIRST: the app-supplied defaults must never override
+  // the User-Agent/Referer these hosts expect.
   return {
+    ...(providerContext.commonHeaders || {}),
     "User-Agent": UA,
     Referer: `${SITE_ORIGIN}/`,
-    ...(providerContext.commonHeaders || {}),
   };
 }
 
@@ -201,9 +203,9 @@ export const getStream = async function ({
 
         const embedRes = await providerContext.axios.get(embedUrl, {
           headers: {
+            ...(providerContext.commonHeaders || {}),
             "User-Agent": UA,
             Referer: `${WATCH_ORIGIN}/`,
-            ...(providerContext.commonHeaders || {}),
           },
           signal,
           timeout: 20000,
@@ -219,44 +221,58 @@ export const getStream = async function ({
           embedUrl
         );
 
-        // hls3 is the site's most reliable CDN variant; hls2 tokens are
-        // ASN-bound and hls4 is a relative playlist on the embed origin.
-        for (const key of ["hls3", "hls2", "hls4"]) {
+        // Reliability order: hls3 is a plain referer-checked CDN that
+        // works from any network; hls4 is a signed path on the embed
+        // origin; hls2 tokens are bound to the resolving network's ASN,
+        // so hls2 is the most fragile and goes last. When an embed yields
+        // several variants they get numbered labels so they are
+        // distinguishable in the app's server list.
+        const variantKeys = ["hls3", "hls4", "hls2"].filter(
+          (key) => links[key] && !seenLinks.has(links[key])
+        );
+        variantKeys.forEach((key, index) => {
           const url = links[key];
-          if (!url || seenLinks.has(url)) continue;
           seenLinks.add(url);
           streams.push({
-            server: serverName,
+            server:
+              variantKeys.length > 1
+                ? `${serverName} ${index + 1}`
+                : serverName,
             link: url,
             type: "m3u8",
             quality,
             subtitles: subtitles.length ? subtitles : undefined,
             headers: { Referer: embedUrl, "User-Agent": UA },
           });
-        }
+        });
       } catch {}
     }
 
-    // Soft playlist verification, mirroring the other providers: drop a
-    // stream only when its playlist definitively is not an m3u8 (a CDN
-    // error page served with HTTP 200); keep it when the check itself
-    // fails (403/timeout - some CDNs are IP/ASN-sensitive).
+    // Playlist check, mirroring the other providers but NON-destructive:
+    // these rotating embed CDNs are flaky and can answer a bare check
+    // with an interstitial page, an empty body or a transient failure
+    // while the very same link plays fine in a player. A resolved link
+    // is therefore dropped ONLY when the CDN definitively says it is
+    // gone (HTTP 404/410); every other outcome keeps the stream. The
+    // previous version dropped any stream whose check body did not start
+    // with #EXTM3U, which silently removed the only robust (non
+    // ASN-bound) hls3 variant for some titles - e.g. the movie "Steps"
+    // was left with a single fragile hls2 stream.
     const verified: Stream[] = [];
     await Promise.all(
       streams.map(async (stream) => {
         try {
-          const res = await providerContext.axios.get(stream.link, {
+          await providerContext.axios.get(stream.link, {
             headers: stream.headers,
             timeout: 8000,
             signal,
           });
-          const text =
-            typeof res.data === "string" ? res.data : JSON.stringify(res.data);
-          if (text.trimStart().startsWith("#EXTM3U")) {
+          verified.push(stream);
+        } catch (err: any) {
+          const status = err?.response?.status;
+          if (status !== 404 && status !== 410) {
             verified.push(stream);
           }
-        } catch {
-          verified.push(stream);
         }
       })
     );
